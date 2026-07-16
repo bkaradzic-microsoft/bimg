@@ -4366,6 +4366,7 @@ static simplewebp_error swebp__vp8l_canonical_code(
 )
 {
 	simplewebp_u16 base[16], real_size, current_base, root, used;
+	simplewebp_u16 symbol_count, single_symbol;
 	struct swebp__vp8l_code_node *tree;
 	size_t i;
 
@@ -4375,6 +4376,8 @@ static simplewebp_error swebp__vp8l_canonical_code(
 	root = 0;
 	used = size;
 	tree = NULL;
+	symbol_count = 0;
+	single_symbol = 0;
 
 	for (i = 0; i < size; i++)
 	{
@@ -4382,10 +4385,19 @@ static simplewebp_error swebp__vp8l_canonical_code(
 		if (length > 0)
 		{
 			base[length - 1]++;
-			real_size++;
+			/* Each codeword contributes at most `length` distinct internal
+			 * (proper-prefix) nodes to the trie. Summing the lengths therefore
+			 * yields a safe upper bound on the number of internal nodes for any
+			 * prefix code, whether it is complete or incomplete. Using the
+			 * previous `real_size = symbolCount - 1` bound is only valid for
+			 * complete codes and under-allocates by one or more nodes for the
+			 * incomplete (but still valid) Huffman codes that WebP lossless
+			 * permits, causing a heap-buffer overflow in swebp__vp8l_insert_code. */
+			real_size += length;
+			symbol_count++;
+			single_symbol = (simplewebp_u16) i;
 		}
 	}
-	real_size--;
 
 	for (i = 0; i < 16; i++)
 	{
@@ -4421,6 +4433,19 @@ static simplewebp_error swebp__vp8l_canonical_code(
 
 	code->size = size;
 	code->tree = tree;
+
+	/* A Huffman code that contains only a single symbol must be decoded by
+	 * consuming zero bits and always yielding that symbol (this matches the
+	 * reference libwebp decoder and the "simple code" path below). The canonical
+	 * trie construction above would instead assign the lone symbol a 1-bit
+	 * codeword, causing swebp__vp8l_read_code to consume one spurious bit per
+	 * read. When such a code is used to read code lengths, that extra bit
+	 * desynchronizes the entire bitstream. Pointing `root` directly at the
+	 * symbol (root < size) makes swebp__vp8l_read_code return it without reading
+	 * any bits. */
+	if (symbol_count == 1)
+		root = single_symbol;
+
 	code->symbol[0] = root & 0xFF;
 	code->symbol[1] = (root >> 8) & 0xFF;
 
@@ -4454,7 +4479,11 @@ static simplewebp_error swebp__vp8l_decode_code_complex(
 	simplewebp_u8 lengths[256 + 24 + 2048];
 	simplewebp_u16 limit, count, p;
 	simplewebp_error err;
-	struct swebp__vp8l_code_node lencode_treemem[18];
+	/* swebp__vp8l_canonical_code now sizes the trie by the sum of code lengths
+	 * (a safe upper bound for incomplete codes). The code-length code has 19
+	 * symbols whose lengths are read as 3 bits each (0..7), so the worst-case
+	 * node count is 19 * 7. */
+	struct swebp__vp8l_code_node lencode_treemem[19 * 7];
 	struct swebp__vp8l_code lc;
 
 	lencode_read = (simplewebp_u8) swebp__vp8l_bitread_read(br, 4) + 4;
