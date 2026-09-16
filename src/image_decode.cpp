@@ -161,6 +161,20 @@ BX_PRAGMA_DIAGNOSTIC_POP();
 
 namespace bimg
 {
+#if BIMG_CONFIG_PARSE_PNG
+	static uint32_t pngReadPackedSample(const uint8_t* _data, uint32_t _index, uint8_t _bitDepth)
+	{
+		const uint64_t bitOffset = uint64_t(_index) * _bitDepth;
+		const uint32_t shift = 8 - _bitDepth - uint32_t(bitOffset & 7);
+		return (_data[bitOffset >> 3] >> shift) & ( (1u << _bitDepth) - 1);
+	}
+
+	static uint8_t pngExpandGraySample(uint32_t _sample, uint8_t _bitDepth)
+	{
+		return uint8_t(_sample * 255 / ( (1u << _bitDepth) - 1) );
+	}
+#endif // BIMG_CONFIG_PARSE_PNG
+
 	static ImageContainer* imageParseLodePng(bx::AllocatorI* _allocator, const void* _data, uint32_t _size, bx::Error* _err)
 	{
 		BX_ERROR_SCOPE(_err);
@@ -193,6 +207,7 @@ namespace bimg
 		{
 			bool palette   = false;
 			bool supported = false;
+			const bool colorKey = 0 != state.info_raw.key_defined;
 
 			switch (state.info_raw.bitdepth)
 			{
@@ -200,7 +215,7 @@ namespace bimg
 				case 2:
 				case 4:
 					palette   = LCT_PALETTE == state.info_raw.colortype;
-					format    = palette ? bimg::TextureFormat::RGBA8 : bimg::TextureFormat::R8;
+					format    = palette ? bimg::TextureFormat::RGBA8 : colorKey ? bimg::TextureFormat::RG8 : bimg::TextureFormat::R8;
 					supported = true;
 					break;
 
@@ -208,7 +223,7 @@ namespace bimg
 					switch (state.info_raw.colortype)
 					{
 						case LCT_GREY:
-							format = bimg::TextureFormat::R8;
+							format = colorKey ? bimg::TextureFormat::RG8 : bimg::TextureFormat::R8;
 							supported = true;
 							break;
 
@@ -218,7 +233,7 @@ namespace bimg
 							break;
 
 						case LCT_RGB:
-							format = bimg::TextureFormat::RGB8;
+							format = colorKey ? bimg::TextureFormat::RGBA8 : bimg::TextureFormat::RGB8;
 							supported = true;
 							break;
 
@@ -247,7 +262,7 @@ namespace bimg
 								uint16_t* rgba = (uint16_t*)data + ii;
 								rgba[0] = bx::toHostEndian(rgba[0], false);
 							}
-							format = bimg::TextureFormat::R16;
+							format = colorKey ? bimg::TextureFormat::RG16 : bimg::TextureFormat::R16;
 							supported = true;
 							break;
 
@@ -305,6 +320,10 @@ namespace bimg
 
 				TextureFormat::Enum dstFormat = format;
 				if (palette) {
+					copyData = NULL;
+				}
+				else if (colorKey)
+				{
 					copyData = NULL;
 				}
 				else if (1 == state.info_raw.bitdepth
@@ -379,6 +398,83 @@ namespace bimg
 						for (uint32_t ii = 0, num = width*height; ii < num; ++ii)
 						{
 							bx::memCopy( (uint8_t*)output->m_data + ii*4, state.info_raw.palette + data[ii]*4, 4);
+						}
+					}
+				}
+				else if (colorKey)
+				{
+					const uint32_t num = width * height;
+					if (LCT_GREY == state.info_raw.colortype)
+					{
+						if (state.info_raw.bitdepth < 8)
+						{
+							for (uint32_t ii = 0; ii < num; ++ii)
+							{
+								const uint32_t sample = pngReadPackedSample(data, ii, uint8_t(state.info_raw.bitdepth) );
+								uint8_t* dst = (uint8_t*)output->m_data + ii*2;
+								dst[0] = pngExpandGraySample(sample, uint8_t(state.info_raw.bitdepth) );
+								dst[1] = sample == state.info_raw.key_r ? 0 : UINT8_MAX;
+								output->m_hasAlpha |= 0 == dst[1];
+							}
+						}
+						else if (8 == state.info_raw.bitdepth)
+						{
+							for (uint32_t ii = 0; ii < num; ++ii)
+							{
+								const uint8_t* src = (uint8_t*)data + ii;
+								uint8_t* dst = (uint8_t*)output->m_data + ii*2;
+								dst[0] = src[0];
+								dst[1] = src[0] == state.info_raw.key_r ? 0 : UINT8_MAX;
+								output->m_hasAlpha |= 0 == dst[1];
+							}
+						}
+						else if (16 == state.info_raw.bitdepth)
+						{
+							for (uint32_t ii = 0; ii < num; ++ii)
+							{
+								const uint16_t* src = (uint16_t*)data + ii;
+								uint16_t* dst = (uint16_t*)output->m_data + ii*2;
+								dst[0] = src[0];
+								dst[1] = src[0] == state.info_raw.key_r ? 0 : UINT16_MAX;
+								output->m_hasAlpha |= 0 == dst[1];
+							}
+						}
+					}
+					else if (LCT_RGB == state.info_raw.colortype)
+					{
+						if (8 == state.info_raw.bitdepth)
+						{
+							for (uint32_t ii = 0; ii < num; ++ii)
+							{
+								const uint8_t* src = (uint8_t*)data + ii*3;
+								uint8_t* dst = (uint8_t*)output->m_data + ii*4;
+								dst[0] = src[0];
+								dst[1] = src[1];
+								dst[2] = src[2];
+								dst[3] = src[0] == state.info_raw.key_r
+									  && src[1] == state.info_raw.key_g
+									  && src[2] == state.info_raw.key_b
+									? 0
+									: UINT8_MAX;
+								output->m_hasAlpha |= 0 == dst[3];
+							}
+						}
+						else if (16 == state.info_raw.bitdepth)
+						{
+							for (uint32_t ii = 0; ii < num; ++ii)
+							{
+								const uint16_t* src = (uint16_t*)data + ii*3;
+								uint16_t* dst = (uint16_t*)output->m_data + ii*4;
+								dst[0] = src[0];
+								dst[1] = src[1];
+								dst[2] = src[2];
+								dst[3] = src[0] == state.info_raw.key_r
+									  && src[1] == state.info_raw.key_g
+									  && src[2] == state.info_raw.key_b
+									? 0
+									: UINT16_MAX;
+								output->m_hasAlpha |= 0 == dst[3];
+							}
 						}
 					}
 				}
